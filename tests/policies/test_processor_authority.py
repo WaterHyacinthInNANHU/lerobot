@@ -23,6 +23,7 @@ over from the checkpoint (the rename map).
 
 import json
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,11 @@ import torch
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.policies.factory import make_policy_config, make_pre_post_processors
+from lerobot.policies.factory import (
+    _resolve_pretrained_processor_loader,
+    make_policy_config,
+    make_pre_post_processors,
+)
 from lerobot.processor import NormalizerProcessorStep, ProcessorBuildContext, UnnormalizerProcessorStep
 from lerobot.utils.constants import (
     ACTION,
@@ -273,3 +278,124 @@ def test_serialized_pipeline_matches_the_golden_fixture(policy_type):
     for role, config in built.items():
         expected = json.loads((ARTIFACTS_DIR / "golden" / f"{policy_type}_{role}.json").read_text())
         assert config == expected, f"{policy_type} {role} pipeline drifted from its golden fixture"
+
+
+# --- the documented opt-out: a policy that owns its own checkpoint loading --------------------------
+
+
+def _register_fake_policy(monkeypatch, loader, policy_type="fakepolicy"):
+    """A synthetic plugin policy whose `processor_*` module may define the pretrained-loader hook.
+
+    Mirrors how the factory resolves real policies — sibling `configuration_*`/`processor_*` modules —
+    without touching the policy registry, so nothing leaks into other tests.
+    """
+    module_root = f"lerobot_plugin_{policy_type}"
+    processor_module = types.ModuleType(f"{module_root}.processor_{policy_type}")
+    if loader is not None:
+        setattr(processor_module, f"make_{policy_type}_pre_post_processors_from_pretrained", loader)
+    monkeypatch.setitem(sys.modules, processor_module.__name__, processor_module)
+
+    config_class = type(
+        "FakePolicyConfig",
+        (),
+        {"__module__": f"{module_root}.configuration_{policy_type}", "type": policy_type},
+    )
+    return config_class()
+
+
+def test_a_policy_can_own_its_checkpoint_loading_without_touching_core(monkeypatch, tmp_path):
+    """Defining `make_{type}_pre_post_processors_from_pretrained` is the whole opt-in.
+
+    The factory names no policy: the hook is resolved by the same naming convention as the regular
+    processor factory, so a plugin can use it and migrating GR00T off it needs no core edit.
+    """
+    calls = []
+
+    def loader(config, pretrained_path, *, revision=None, context=None, **_):
+        calls.append({"path": pretrained_path, "revision": revision, "training": context.training})
+        return "PRE", "POST"
+
+    config = _register_fake_policy(monkeypatch, loader)
+
+    result = make_pre_post_processors(
+        config,
+        pretrained_path=str(tmp_path),
+        pretrained_revision="v1",
+        context=ProcessorBuildContext(training=True),
+    )
+
+    assert result == ("PRE", "POST"), "the policy's loader owns the result; core must not rebuild"
+    assert calls == [{"path": str(tmp_path), "revision": "v1", "training": True}]
+
+
+def test_the_hook_is_ignored_when_no_checkpoint_is_given(monkeypatch):
+    """It is a *pretrained* loader: building from scratch always goes through the normal factory."""
+
+    def loader(config, pretrained_path, **_):
+        raise AssertionError("the pretrained loader must not run without a checkpoint")
+
+    config = _register_fake_policy(monkeypatch, loader)
+
+    with pytest.raises(ValueError, match="not implemented"):
+        make_pre_post_processors(config, context=ProcessorBuildContext())
+
+
+def test_a_loader_receives_only_the_parameters_it_declares(monkeypatch, tmp_path):
+    """A minimal `(config, pretrained_path)` signature is enough; the rest is opt-in by name."""
+
+    def loader(config, pretrained_path):
+        return f"PRE:{pretrained_path}", "POST"
+
+    config = _register_fake_policy(monkeypatch, loader)
+
+    pre, post = make_pre_post_processors(
+        config, pretrained_path=str(tmp_path), context=ProcessorBuildContext()
+    )
+
+    assert (pre, post) == (f"PRE:{tmp_path}", "POST")
+
+
+def test_a_loader_requiring_an_unsupplyable_parameter_is_rejected(monkeypatch, tmp_path):
+    """Fail with the contract spelled out, rather than an opaque TypeError from the call."""
+
+    def loader(config, pretrained_path, robot_kinematics):
+        raise AssertionError("should not be reached")
+
+    config = _register_fake_policy(monkeypatch, loader)
+
+    with pytest.raises(ValueError, match="robot_kinematics"):
+        make_pre_post_processors(config, pretrained_path=str(tmp_path), context=ProcessorBuildContext())
+
+
+def test_a_policy_without_the_hook_rebuilds_from_its_config(monkeypatch, tmp_path):
+    """The default for every policy, including one whose processor module exists but has no hook."""
+    _save_checkpoint(tmp_path, _act_config(), _stats(1.0))
+
+    assert _resolve_pretrained_processor_loader(_act_config()) is None
+
+    pre, _ = make_pre_post_processors(
+        _act_config(), pretrained_path=str(tmp_path), context=ProcessorBuildContext()
+    )
+    # Rebuilt from the config, then filled from the checkpoint.
+    assert torch.allclose(_normalizer(pre)._tensor_stats[OBS_STATE]["mean"], torch.full((STATE_DIM,), 1.0))
+
+
+def test_groot_is_the_only_in_tree_policy_using_the_hook():
+    """Pins the current routing: GR00T opts out, everyone else rebuilds from config.
+
+    Resolution only — instantiating GR00T's pipelines needs a gated backbone. When GR00T is migrated,
+    deleting its loader is enough to flip it onto the rebuild path, and this test says so.
+    """
+    using_hook = []
+    for policy_type in sorted(PreTrainedConfig.get_known_choices()):
+        config_class = PreTrainedConfig.get_choice_class(policy_type)
+        try:
+            loader = _resolve_pretrained_processor_loader(config_class.__new__(config_class))
+        except Exception as exc:  # noqa: BLE001
+            if _is_missing_optional_dependency(f"{type(exc).__name__}: {exc}"):
+                continue
+            raise
+        if loader is not None:
+            using_hook.append(policy_type)
+
+    assert using_hook in ([], ["groot"]), f"unexpected policies own their checkpoint loading: {using_hook}"

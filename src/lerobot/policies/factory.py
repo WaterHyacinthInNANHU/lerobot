@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 
@@ -185,22 +186,22 @@ def make_pre_post_processors(
         pretrained_revision=pretrained_revision,
     )
 
-    if pretrained_path and _uses_legacy_pretrained_loader(policy_cfg):
-        # GR00T has not been migrated to the rule above and still deserializes its saved pipelines,
-        # then repairs them. See `_uses_legacy_pretrained_loader`.
-        from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
-
-        return make_groot_pre_post_processors_from_pretrained(
-            config=policy_cfg,
-            pretrained_path=pretrained_path,
-            revision=pretrained_revision,
-            dataset_stats=context.dataset_stats,
-            dataset_meta=context.dataset_meta,
-            preprocessor_overrides=kwargs.get("preprocessor_overrides"),
-            postprocessor_overrides=kwargs.get("postprocessor_overrides"),
-            preprocessor_config_filename=pre_filename,
-            postprocessor_config_filename=post_filename,
-        )
+    if pretrained_path:
+        # A policy whose pipelines cannot be rebuilt from its config loads them itself. See
+        # `_resolve_pretrained_processor_loader` for the opt-in and why it exists.
+        loader = _resolve_pretrained_processor_loader(policy_cfg)
+        if loader is not None:
+            return _call_pretrained_processor_loader(
+                loader,
+                config=policy_cfg,
+                pretrained_path=pretrained_path,
+                revision=pretrained_revision,
+                context=context,
+                preprocessor_overrides=kwargs.get("preprocessor_overrides"),
+                postprocessor_overrides=kwargs.get("postprocessor_overrides"),
+                preprocessor_config_filename=pre_filename,
+                postprocessor_config_filename=post_filename,
+            )
 
     if pretrained_path:
         # Read the saved preprocessor before building, only to recover a rename map the caller did
@@ -222,20 +223,101 @@ def make_pre_post_processors(
     return preprocessor, postprocessor
 
 
-def _uses_legacy_pretrained_loader(policy_cfg: PreTrainedConfig) -> bool:
-    """Whether this policy still deserializes its saved pipelines instead of rebuilding them.
+def _resolve_processor_module(config: PreTrainedConfig, *, required: bool) -> Any | None:
+    """Import the ``processor_*`` module that sits beside this config's ``configuration_*`` module.
 
-    Only GR00T does. Rebuilding its pipelines from the config is not yet possible: two of its steps
-    are stateful, and for checkpoints converted from a raw N1.7 release the values those steps need
-    (``raw_stats``, ``modality_config``, ``video_modality_keys``) exist *only* inside the serialized
-    pipeline JSON — there is no sidecar and no config field to rebuild them from. Migrating GR00T
-    therefore means teaching its config to carry those values plus a reader for checkpoints that
-    predate them, and that cannot be validated without the gated backbone its tests download.
+    e.g. `configuration_diffusion` -> `processor_diffusion`. Works for built-in policies and 3rd
+    party lerobot plugins, and keeps policy imports lazy.
 
-    Resolved by attribute rather than by importing `GrootConfig`, so the check stays lazy and this
-    module keeps its no-eager-policy-imports property.
+    Args:
+        config: The policy configuration whose processor module to resolve.
+        required: Whether a missing module is an error. When False, returns None instead, so callers
+            probing for an optional hook do not turn "no processor module" into a failure.
+
+    Raises:
+        ValueError: If `required` and this policy type has no processor module.
     """
-    return policy_cfg.type == "groot"
+    module_path = config.__class__.__module__.replace("configuration_", "processor_")
+    try:
+        return importlib.import_module(module_path)
+    except ModuleNotFoundError as e:
+        if e.name == module_path:
+            # The processor_* module itself does not exist for this policy type. A missing optional
+            # dependency inside an existing module propagates unchanged instead, so its actionable
+            # install hint stays visible.
+            if required:
+                raise ValueError(f"Processor for policy type '{config.type}' is not implemented.") from e
+            return None
+        raise
+
+
+def _resolve_pretrained_processor_loader(policy_cfg: PreTrainedConfig) -> Callable[..., Any] | None:
+    """The policy's own checkpoint loader, or None if it rebuilds from its config like everyone else.
+
+    A policy opts out of "structure comes from the config" by defining
+    ``make_{type}_pre_post_processors_from_pretrained`` in its ``processor_*`` module, resolved by the
+    same naming convention as `make_{type}_pre_post_processors`. It is then handed the checkpoint and
+    owns loading entirely; `make_pre_post_processors` neither rebuilds nor patches anything.
+
+    This exists for pipelines that genuinely cannot be rebuilt from a config. GR00T is the only
+    in-tree case: two of its steps are stateful, and for checkpoints converted from a raw N1.7
+    release the values those steps need (``raw_stats``, ``modality_config``,
+    ``video_modality_keys``) live *only* inside the serialized pipeline JSON — there is no sidecar
+    and no config field to rebuild them from. Prefer adding the missing config fields over using
+    this hook: it forfeits config authority, so `--policy.*` flags stop reaching the pipeline.
+
+    Only the parameters the loader declares are passed, so it may accept as few as
+    ``(config, pretrained_path)``; see `_call_pretrained_processor_loader`.
+    """
+    module = _resolve_processor_module(policy_cfg, required=False)
+    if module is None:
+        return None
+    return getattr(module, f"make_{policy_cfg.type}_pre_post_processors_from_pretrained", None)
+
+
+def _call_pretrained_processor_loader(
+    loader: Callable[..., Any],
+    *,
+    config: PreTrainedConfig,
+    pretrained_path: str,
+    revision: str | None,
+    context: ProcessorBuildContext,
+    preprocessor_overrides: dict[str, Any] | None,
+    postprocessor_overrides: dict[str, Any] | None,
+    preprocessor_config_filename: str,
+    postprocessor_config_filename: str,
+) -> tuple[Any, Any]:
+    """Call a policy-owned checkpoint loader with the subset of arguments it declares.
+
+    Same legacy-adapter approach as `_make_processors_from_policy_config`: matching is by parameter
+    name, so a loader opts into what it needs and ignores the rest.
+    """
+    available: dict[str, Any] = {
+        "config": config,
+        "pretrained_path": pretrained_path,
+        "revision": revision,
+        "context": context,
+        "dataset_stats": context.dataset_stats,
+        "dataset_meta": context.dataset_meta,
+        "preprocessor_overrides": preprocessor_overrides,
+        "postprocessor_overrides": postprocessor_overrides,
+        "preprocessor_config_filename": preprocessor_config_filename,
+        "postprocessor_config_filename": postprocessor_config_filename,
+    }
+    parameters = inspect.signature(loader).parameters
+    unsupported = [
+        name
+        for name, parameter in parameters.items()
+        if name not in available
+        and parameter.default is inspect.Parameter.empty
+        and parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+    ]
+    if unsupported:
+        raise ValueError(
+            f"'{loader.__name__}' requires parameter(s) {unsupported} that make_pre_post_processors "
+            f"cannot supply. Declare only names from {sorted(available)}, or give them defaults."
+        )
+    return loader(**{name: value for name, value in available.items() if name in parameters})
 
 
 def _peek_pipeline_config(
@@ -517,21 +599,8 @@ def _make_processors_from_policy_config(
 
     policy_type = config.type
     function_name = f"make_{policy_type}_pre_post_processors"
-    module_path = config.__class__.__module__.replace(
-        "configuration_", "processor_"
-    )  # e.g., configuration_diffusion -> processor_diffusion
-    logging.debug(
-        f"Instantiating pre/post processors using function '{function_name}' from module '{module_path}'"
-    )
-    try:
-        module = importlib.import_module(module_path)
-    except ModuleNotFoundError as e:
-        if e.name == module_path:
-            # The processor_* module itself does not exist for this policy type. A missing
-            # optional dependency inside an existing module propagates unchanged instead,
-            # so its actionable install hint stays visible.
-            raise ValueError(f"Processor for policy type '{policy_type}' is not implemented.") from e
-        raise
+    logging.debug(f"Instantiating pre/post processors using function '{function_name}'")
+    module = _resolve_processor_module(config, required=True)
     function = getattr(module, function_name, None)
     if function is None:
         raise ValueError(f"Processor for policy type '{policy_type}' is not implemented.")
