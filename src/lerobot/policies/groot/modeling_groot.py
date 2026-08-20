@@ -443,10 +443,14 @@ class GrootPolicy(PreTrainedPolicy):
         inputs["action"] = prev_actions
         return inputs, options
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Training forward pass.
 
         Delegates to Isaac-GR00T model.forward when inputs are compatible.
+
+        reduction="none" returns per-sample losses (B,) for AXIS sample weighting; the
+        per-element `action_loss` is already exported by the in-tree action head
+        (groot_n1_7.py), so this is a reduction change, not a model change.
         """
         groot_inputs = self._filter_groot_inputs(batch, include_action=True)
 
@@ -467,6 +471,19 @@ class GrootPolicy(PreTrainedPolicy):
             )
 
         loss_dict = {"loss": loss.item()}
+
+        if reduction == "none":
+            action_loss = outputs.get("action_loss")  # already masked, same shape as action_mask
+            if action_loss is None:
+                raise RuntimeError(
+                    "GR00T model.forward did not return 'action_loss'; cannot compute per-sample "
+                    "losses for reduction='none'."
+                )
+            mask = groot_inputs["action_mask"]
+            reduce_dims = tuple(range(1, action_loss.ndim))
+            mask_sums = mask.sum(dim=tuple(range(1, mask.ndim)))
+            per_sample_loss = action_loss.sum(dim=reduce_dims) / (mask_sums + 1e-6)
+            return per_sample_loss, loss_dict
 
         return loss, loss_dict
 
