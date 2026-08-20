@@ -178,6 +178,13 @@ class TrainPipelineConfig(HubMixin):
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
 
+    # AXIS-Bench: train only on an explicit row set (flat global frame indices, .npz key
+    # "rows"). Replaces EpisodeAwareSampler; see WaterHyacinthInNANHU/AXIS-Bench morevlas docs.
+    axis_rows_path: str | None = None
+    # Refuse to start if the dataset's frame count differs — the rows artifact indexes ONE
+    # specific merged corpus, and a mismatch means every index lands on the wrong frame.
+    axis_expected_frames: int | None = None
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)

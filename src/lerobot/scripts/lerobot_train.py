@@ -256,6 +256,25 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def _make_axis_sampler(rows_path: str, seed: int):
+    """Build an AxisRowSampler over the flat global frame indices stored at `rows_path`."""
+    import numpy as np
+
+    from lerobot.datasets.axis_sampler import AxisRowSampler
+
+    rows = np.load(rows_path)["rows"]
+    return AxisRowSampler(rows=rows, seed=seed)
+
+
+def _check_axis_frames(dataset, expected: int | None) -> None:
+    """Refuse to start if the dataset's frame count doesn't match the AXIS rows artifact."""
+    if expected is not None and dataset.num_frames != expected:
+        raise RuntimeError(
+            f"dataset has {dataset.num_frames} frames but axis_expected_frames={expected}: "
+            "the AXIS artifacts index a different corpus; refusing to train"
+        )
+
+
 def make_dataloaders(
     cfg: TrainPipelineConfig,
     dataset,
@@ -283,22 +302,35 @@ def make_dataloaders(
         dataloader and the eval dataloader (None when no eval split exists).
     """
     active_cfg = cfg.trainable_config
+    if cfg.axis_rows_path is not None and cfg.dataset.streaming:
+        # The rows artifact indexes flat global frame positions in a map-style dataset;
+        # streaming datasets have no such indexing, so silently ignoring axis_rows_path here
+        # would train on the wrong (unrestricted) data without any signal.
+        raise ValueError(
+            "axis_rows_path is set but cfg.dataset.streaming=True: AxisRowSampler requires a "
+            "map-style dataset; refusing to silently ignore the rows artifact"
+        )
     if not cfg.dataset.streaming:
-        # All non-streaming (map-style) datasets use EpisodeAwareSampler.
+        # All non-streaming (map-style) datasets use EpisodeAwareSampler, unless an AXIS rows
+        # artifact is provided, in which case AxisRowSampler restricts training to those rows.
         # The order is a pure function of (seed, epoch), so every rank independently produces the
         # same permutation. accelerate then shards it disjointly across data-parallel ranks via
         # BatchSamplerShard without needing a `generator` attribute to synchronize an RNG, and
         # resume is sample-exact.
         shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-            shuffle=True,
-            seed=cfg.seed if cfg.seed is not None else 0,
-            absolute_to_relative_idx=dataset.absolute_to_relative_idx,
-        )
+        if cfg.axis_rows_path is not None:
+            _check_axis_frames(dataset, cfg.axis_expected_frames)
+            sampler = _make_axis_sampler(cfg.axis_rows_path, seed=cfg.seed if cfg.seed is not None else 0)
+        else:
+            sampler = EpisodeAwareSampler(
+                dataset.meta.episodes["dataset_from_index"],
+                dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=dataset.episodes,
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                shuffle=True,
+                seed=cfg.seed if cfg.seed is not None else 0,
+                absolute_to_relative_idx=dataset.absolute_to_relative_idx,
+            )
         if cfg.resume and step > 0:
             # The resume offset depends on the (dp_world_size, batch_size) that produced `step`,
             # so use the values recorded in the checkpoint (falling back to the current ones for
