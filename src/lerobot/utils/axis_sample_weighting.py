@@ -5,6 +5,7 @@ every frame outside the planned row set). NaN here is a GUARD, not a gap: the ro
 this weighter must agree about the trainable rows, and a batch index hitting NaN means they
 do not — which is fatal, exactly as openpi refuses partially-weighted objectives.
 """
+
 from __future__ import annotations
 
 import numpy as np

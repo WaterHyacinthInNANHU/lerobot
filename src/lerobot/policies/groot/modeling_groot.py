@@ -479,7 +479,14 @@ class GrootPolicy(PreTrainedPolicy):
                     "GR00T model.forward did not return 'action_loss'; cannot compute per-sample "
                     "losses for reduction='none'."
                 )
-            mask = groot_inputs["action_mask"]
+            # Prefer the mask the model actually applied (groot_n1_7.py's action head returns it
+            # alongside action_loss) over the input mask: the two are expected to agree, but the
+            # output mask is the one load-bearing for what action_loss was computed against, and
+            # falling back to the input only when the output lacks it keeps this correct even if
+            # some future action head does not export it.
+            mask = outputs.get("action_mask")
+            if mask is None:
+                mask = groot_inputs["action_mask"]
             reduce_dims = tuple(range(1, action_loss.ndim))
             mask_sums = mask.sum(dim=tuple(range(1, mask.ndim)))
             per_sample_loss = action_loss.sum(dim=reduce_dims) / (mask_sums + 1e-6)

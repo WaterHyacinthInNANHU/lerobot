@@ -124,6 +124,7 @@ def make_sample_weighter(
 
     if config.type == "axis_flat":
         from lerobot.utils.axis_sample_weighting import AxisFlatWeighter
+
         return AxisFlatWeighter(config, device)
 
     if config.type == "rabc":
@@ -133,7 +134,9 @@ def make_sample_weighter(
         # No-op weighter that returns uniform weights
         return UniformWeighter(device=device)
 
-    raise ValueError(f"Unknown sample weighting type: '{config.type}'. Supported types: 'axis_flat', 'rabc', 'uniform'")
+    raise ValueError(
+        f"Unknown sample weighting type: '{config.type}'. Supported types: 'axis_flat', 'rabc', 'uniform'"
+    )
 
 
 def _make_rabc_weighter(

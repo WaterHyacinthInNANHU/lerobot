@@ -338,6 +338,25 @@ class TrainPipelineConfig(HubMixin):
         if self.save_checkpoint_to_hub and not (self.policy is not None and self.policy.repo_id):
             raise ValueError("save_checkpoint_to_hub requires --policy.repo_id.")
 
+        if self.axis_rows_path is not None:
+            if self.axis_expected_frames is None:
+                raise ValueError(
+                    "axis_rows_path requires axis_expected_frames: the rows artifact indexes ONE "
+                    "specific merged corpus by global frame count, and without a declared expected "
+                    "count a silent mismatch would land every index on the wrong frame."
+                )
+            if (
+                self.dataset.episodes is not None
+                or self.dataset.exclude_episodes is not None
+                or (self.dataset.eval_split > 0)
+            ):
+                raise ValueError(
+                    "axis_rows_path requires dataset.episodes, dataset.exclude_episodes, and "
+                    "dataset.eval_split to be unset/zero: axis row sampling requires the full, "
+                    "unfiltered dataset -- global frame indices would silently misalign against a "
+                    "filtered or split episode set."
+                )
+
         self._validate_distributed()
 
     def _validate_distributed(self) -> None:

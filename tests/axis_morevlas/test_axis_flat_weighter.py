@@ -17,8 +17,10 @@ def _weighter(tmp_path, weights, expected=None):
 
     cfg = SampleWeightingConfig(
         type="axis_flat",
-        extra_params={"weights_path": str(_npz(tmp_path, weights)),
-                      "expected_frames": expected or len(weights)},
+        extra_params={
+            "weights_path": str(_npz(tmp_path, weights)),
+            "expected_frames": expected or len(weights),
+        },
     )
     return AxisFlatWeighter(cfg, torch.device("cpu"))
 

@@ -256,13 +256,26 @@ def update_policy(
     return train_metrics, output_dict
 
 
-def _make_axis_sampler(rows_path: str, seed: int):
-    """Build an AxisRowSampler over the flat global frame indices stored at `rows_path`."""
+def _make_axis_sampler(rows_path: str, seed: int, num_frames: int):
+    """Build an AxisRowSampler over the flat global frame indices stored at `rows_path`.
+
+    `num_frames` guards the sampler/dataset join directly: `axis_expected_frames` (checked by
+    `_check_axis_frames`) only confirms the dataset's total frame count matches what the rows
+    artifact was built against, not that every individual row index actually falls inside that
+    range. A corrupted or mis-generated rows artifact could still carry an out-of-range index
+    even when the totals happen to agree, so refuse up front rather than surface an IndexError
+    (or, worse, a silently wrapped/misaligned frame) deep inside training.
+    """
     import numpy as np
 
     from lerobot.datasets.axis_sampler import AxisRowSampler
 
     rows = np.load(rows_path)["rows"]
+    if rows.size and int(rows.max()) >= num_frames:
+        raise ValueError(
+            f"axis rows artifact at {rows_path!r} has a row index {int(rows.max())} out of range "
+            f"for a dataset with {num_frames} frames: refusing to train"
+        )
     return AxisRowSampler(rows=rows, seed=seed)
 
 
@@ -320,7 +333,11 @@ def make_dataloaders(
         shuffle = False
         if cfg.axis_rows_path is not None:
             _check_axis_frames(dataset, cfg.axis_expected_frames)
-            sampler = _make_axis_sampler(cfg.axis_rows_path, seed=cfg.seed if cfg.seed is not None else 0)
+            sampler = _make_axis_sampler(
+                cfg.axis_rows_path,
+                seed=cfg.seed if cfg.seed is not None else 0,
+                num_frames=dataset.num_frames,
+            )
         else:
             sampler = EpisodeAwareSampler(
                 dataset.meta.episodes["dataset_from_index"],

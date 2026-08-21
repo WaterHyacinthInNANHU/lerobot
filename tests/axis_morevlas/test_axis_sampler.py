@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import torch
 
 
 def test_yields_exactly_the_given_rows_shuffled():
