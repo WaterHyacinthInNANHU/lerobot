@@ -184,6 +184,10 @@ class TrainPipelineConfig(HubMixin):
     # Refuse to start if the dataset's frame count differs — the rows artifact indexes ONE
     # specific merged corpus, and a mismatch means every index lands on the wrong frame.
     axis_expected_frames: int | None = None
+    # AXIS-Bench: replay a precomputed index schedule (Drop/Anneal arms) in exact file order,
+    # written by axis.dataset.build_index_schedule.write_schedule (.npz keys "rows", "meta").
+    # Mutually exclusive with axis_rows_path and sample_weighting — see validate().
+    axis_schedule_path: str | None = None
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
@@ -355,6 +359,39 @@ class TrainPipelineConfig(HubMixin):
                     "dataset.eval_split to be unset/zero: axis row sampling requires the full, "
                     "unfiltered dataset -- global frame indices would silently misalign against a "
                     "filtered or split episode set."
+                )
+
+        if self.axis_schedule_path is not None:
+            if self.axis_rows_path is not None:
+                raise ValueError(
+                    "axis_schedule_path and axis_rows_path are two different AXIS sampling "
+                    "regimes at once -- a schedule replay (every draw decided offline) and a "
+                    "uniform row draw cannot both drive the sampler. Pass only one axis_* path."
+                )
+            if self.axis_expected_frames is None:
+                raise ValueError(
+                    "axis_schedule_path requires axis_expected_frames: the schedule artifact "
+                    "indexes ONE specific merged corpus by global frame count, and without a "
+                    "declared expected count a silent mismatch would land every index on the "
+                    "wrong frame."
+                )
+            if self.sample_weighting is not None:
+                raise ValueError(
+                    "axis_schedule_path and sample_weighting are two arms at once: the schedule "
+                    "already decided every draw offline, so layering sample_weighting on top "
+                    "would apply a second weighting to indices that are no longer being redrawn "
+                    "(mirrors openpi config.py's schedule+quality-conditioning refusal)."
+                )
+            if (
+                self.dataset.episodes is not None
+                or self.dataset.exclude_episodes is not None
+                or (self.dataset.eval_split > 0)
+            ):
+                raise ValueError(
+                    "axis_schedule_path requires dataset.episodes, dataset.exclude_episodes, and "
+                    "dataset.eval_split to be unset/zero: the schedule's row indices are positions "
+                    "in the full, unfiltered corpus it was built against -- a filtered or split "
+                    "episode set would silently misalign them."
                 )
 
         self._validate_distributed()

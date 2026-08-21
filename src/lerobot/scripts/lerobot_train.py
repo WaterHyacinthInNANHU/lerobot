@@ -279,6 +279,71 @@ def _make_axis_sampler(rows_path: str, seed: int, num_frames: int):
     return AxisRowSampler(rows=rows, seed=seed)
 
 
+def _make_axis_schedule_sampler(schedule_path: str, num_frames: int):
+    """Build an AxisScheduleSampler replaying the index schedule at `schedule_path`.
+
+    All bounds/meta checks (dtype, shape, n_rows binding, row range) live in
+    AxisScheduleSampler.__init__ itself -- unlike `_make_axis_sampler`, there is no separate
+    out-of-range guard needed here, since the schedule's own construction already refuses a row
+    beyond `num_frames`.
+    """
+    from lerobot.datasets.axis_sampler import AxisScheduleSampler
+
+    return AxisScheduleSampler(schedule_path, expected_frames=num_frames)
+
+
+def _check_axis_schedule_budget(sampler, batch_size: int, num_train_steps: int) -> None:
+    """Refuse a run whose batch size or step budget disagrees with the schedule artifact.
+
+    Mirrors openpi's `ScheduleSampler.check_batch` / `check_num_train_steps`
+    (schedule_sampler.py:60-91), checked at the same point openpi checks them: at the data
+    loader call site, once `cfg.batch_size` and the training step budget are both known
+    (data_loader.py:827, 833) -- not in `validate()`, since neither the batch/DataLoader join
+    nor the step budget's relationship to the artifact is knowable there.
+
+    Batch: torch's DataLoader cuts the sampler's flat index stream into batches of
+    `batch_size`, so the schedule's row-major (total_steps, batch) block only reproduces the
+    artifact's own batches one-for-one when `batch_size == sampler.batch`. A SMALLER
+    `batch_size` silently splits each scheduled row into multiple real batches, doubling (or
+    worse) the optimizer steps spent on the same content with no error. A LARGER `batch_size`
+    silently concatenates two-or-more scheduled rows into one real batch -- for the anneal arm
+    this merges draws from opposite sides of the ramp boundary into a single step, corrupting
+    exactly the transition the arm exists to control.
+
+    Steps: the torch DataLoader restarts an exhausted sampler rather than raising, so a step
+    budget longer than the schedule silently replays it from row 0 and grants an unrequested
+    extra pass. A budget shorter than the schedule is merely a truncated run, but it
+    invalidates the artifact's own coverage numbers (epochs, unique frames) -- so, mirroring
+    openpi's exact policy, it is logged rather than refused.
+    """
+    if batch_size != sampler.batch:
+        raise ValueError(
+            f"axis_schedule_path batch mismatch: the schedule was built for batch={sampler.batch} "
+            f"but training requests batch_size={batch_size}. A smaller batch_size would split a "
+            "scheduled row into multiple real batches (silently multiplying the optimizer steps "
+            "spent on the same content); a larger one would concatenate rows across the "
+            "schedule's own batch boundaries (e.g. merging draws from opposite sides of the "
+            "anneal ramp into one step). The artifact IS the experiment's record of what was "
+            f"seen; regenerate it for batch_size={batch_size} rather than reshaping it here."
+        )
+    if num_train_steps > sampler.total_steps:
+        raise ValueError(
+            f"axis_schedule_path step-budget mismatch: cfg.steps={num_train_steps} exceeds the "
+            f"schedule ({sampler.total_steps} steps). The loader restarts an exhausted sampler "
+            "from row 0 rather than raising, silently granting an extra pass nobody asked for; "
+            f"rebuild the artifact for {num_train_steps} steps, or shorten cfg.steps."
+        )
+    if num_train_steps < sampler.total_steps:
+        logging.warning(
+            "axis_schedule_path: cfg.steps=%d is short of the schedule's %d steps -- the run "
+            "will see only %.1f%% of the scheduled batches, so the artifact's own "
+            "epochs/unique-frames numbers do not describe this run.",
+            num_train_steps,
+            sampler.total_steps,
+            100.0 * num_train_steps / sampler.total_steps,
+        )
+
+
 def _check_axis_frames(dataset, expected: int | None) -> None:
     """Refuse to start if the dataset's frame count doesn't match the AXIS rows artifact."""
     if expected is not None and dataset.num_frames != expected:
@@ -323,15 +388,27 @@ def make_dataloaders(
             "axis_rows_path is set but cfg.dataset.streaming=True: AxisRowSampler requires a "
             "map-style dataset; refusing to silently ignore the rows artifact"
         )
+    if cfg.axis_schedule_path is not None and cfg.dataset.streaming:
+        # Same reasoning as the axis_rows_path guard above: the schedule's rows are flat global
+        # frame positions in a map-style dataset, and streaming has no such indexing.
+        raise ValueError(
+            "axis_schedule_path is set but cfg.dataset.streaming=True: AxisScheduleSampler "
+            "requires a map-style dataset; refusing to silently ignore the schedule artifact"
+        )
     if not cfg.dataset.streaming:
-        # All non-streaming (map-style) datasets use EpisodeAwareSampler, unless an AXIS rows
-        # artifact is provided, in which case AxisRowSampler restricts training to those rows.
-        # The order is a pure function of (seed, epoch), so every rank independently produces the
-        # same permutation. accelerate then shards it disjointly across data-parallel ranks via
-        # BatchSamplerShard without needing a `generator` attribute to synchronize an RNG, and
-        # resume is sample-exact.
+        # All non-streaming (map-style) datasets use EpisodeAwareSampler, unless an AXIS rows or
+        # schedule artifact is provided, in which case AxisRowSampler/AxisScheduleSampler
+        # restricts training to those rows. The row-sampler order is a pure function of
+        # (seed, epoch) (the schedule's order is fixed, full stop), so every rank independently
+        # produces the same sequence. accelerate then shards it disjointly across data-parallel
+        # ranks via BatchSamplerShard without needing a `generator` attribute to synchronize an
+        # RNG, and resume is sample-exact for the row sampler (refused outright for the schedule
+        # sampler -- see AxisScheduleSampler.load_state_dict).
         shuffle = False
-        if cfg.axis_rows_path is not None:
+        if cfg.axis_schedule_path is not None:
+            sampler = _make_axis_schedule_sampler(cfg.axis_schedule_path, dataset.num_frames)
+            _check_axis_schedule_budget(sampler, cfg.batch_size, cfg.steps)
+        elif cfg.axis_rows_path is not None:
             _check_axis_frames(dataset, cfg.axis_expected_frames)
             sampler = _make_axis_sampler(
                 cfg.axis_rows_path,
