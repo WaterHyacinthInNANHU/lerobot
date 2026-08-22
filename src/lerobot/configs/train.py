@@ -188,6 +188,11 @@ class TrainPipelineConfig(HubMixin):
     # written by axis.dataset.build_index_schedule.write_schedule (.npz keys "rows", "meta").
     # Mutually exclusive with axis_rows_path and sample_weighting — see validate().
     axis_schedule_path: str | None = None
+    # AXIS-Bench: CFG quality-tag batch hook (openpi build_quality_labels .npz format). Appends
+    # "\nQuality: {tag}" to batch["task"] keyed on the dataset's global frame index; tag 0 leaves
+    # the task bare (the unconditional CFG branch). Requires axis_rows_path (a committed row set
+    # to bind the tag artifact to) and excludes axis_schedule_path — see validate().
+    axis_quality_path: str | None = None
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
@@ -392,6 +397,22 @@ class TrainPipelineConfig(HubMixin):
                     "dataset.eval_split to be unset/zero: the schedule's row indices are positions "
                     "in the full, unfiltered corpus it was built against -- a filtered or split "
                     "episode set would silently misalign them."
+                )
+
+        if self.axis_quality_path is not None:
+            if self.axis_schedule_path is not None:
+                raise ValueError(
+                    "axis_quality_path and axis_schedule_path are two different AXIS regimes at "
+                    "once: the schedule replay already decided every draw offline, and the "
+                    "quality-tag hook needs a committed row set (axis_rows_path) to bind against, "
+                    "not a schedule (mirrors openpi config.py's schedule+quality-conditioning "
+                    "refusal). Pass only one axis_* path alongside axis_quality_path."
+                )
+            if self.axis_rows_path is None:
+                raise ValueError(
+                    "axis_quality_path requires axis_rows_path: the quality-tag hook conditions "
+                    "a row-restricted CFG arm, and without a committed row set there is nothing "
+                    "for the tag artifact's index space to bind against."
                 )
 
         self._validate_distributed()

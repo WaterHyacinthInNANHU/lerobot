@@ -344,6 +344,18 @@ def _check_axis_schedule_budget(sampler, batch_size: int, num_train_steps: int) 
         )
 
 
+def _make_axis_quality_tags(quality_path: str, num_frames: int):
+    """Build an AxisQualityTags over the shipped CFG quality artifact at `quality_path`.
+
+    Mirrors `_make_axis_sampler`'s shape: a pure function, callable without a real dataset.
+    `num_frames` is passed through as `expected_frames` -- all of the join/shape/content checks
+    live in `AxisQualityTags.__init__` itself, same as `_make_axis_schedule_sampler`.
+    """
+    from lerobot.utils.axis_quality import AxisQualityTags
+
+    return AxisQualityTags(quality_path, expected_frames=num_frames)
+
+
 def _check_axis_frames(dataset, expected: int | None) -> None:
     """Refuse to start if the dataset's frame count doesn't match the AXIS rows artifact."""
     if expected is not None and dataset.num_frames != expected:
@@ -718,6 +730,15 @@ def train(cfg: TrainPipelineConfig):
             dataset_repo_id=cfg.dataset.repo_id,
         )
 
+    axis_quality_tags = None
+    apply_quality_tags = None
+    if cfg.axis_quality_path is not None:
+        from lerobot.utils.axis_quality import apply_quality_tags
+
+        if is_main_process():
+            logging.info(f"Creating CFG quality tags: {cfg.axis_quality_path}")
+        axis_quality_tags = _make_axis_quality_tags(cfg.axis_quality_path, dataset.num_frames)
+
     # --- banner (main process only; numel() reads metadata — on DTensors it is the GLOBAL shape,
     # so the totals are correct even after sharding) ---------------------------------------------
     # One loop step consumes one micro-batch on every dp worker; the optimizer sees
@@ -854,6 +875,14 @@ def train(cfg: TrainPipelineConfig):
         batch = next(dl_iter)
         preprocessing_start = time.perf_counter()
         train_tracker.dataloading_s = preprocessing_start - step_start
+        if axis_quality_tags is not None:
+            quality_stats = apply_quality_tags(batch, axis_quality_tags)
+            # Same mechanism sample_weight_* stats use to reach the `step:N` log line: update_policy
+            # merges its output_dict into train_tracker via update_metrics (logging_utils.py:184-197),
+            # which auto-registers a meter for any key not already known to the tracker. This hook
+            # runs in the train loop, before update_policy is even called, so it merges directly
+            # into the SAME train_tracker object rather than routing through output_dict.
+            train_tracker.update_metrics(quality_stats)
         batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start
 
