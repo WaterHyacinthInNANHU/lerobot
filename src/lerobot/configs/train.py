@@ -193,6 +193,21 @@ class TrainPipelineConfig(HubMixin):
     # the task bare (the unconditional CFG branch). Requires axis_rows_path (a committed row set
     # to bind the tag artifact to) and excludes axis_schedule_path — see validate().
     axis_quality_path: str | None = None
+    # AXIS-Bench: bind axis_schedule_path/axis_quality_path to the arm this run's config claims
+    # to be. Nothing else does this -- mirrors openpi's DataConfig.expected_mode (checked against
+    # the schedule artifact's own meta["mode"] in lerobot_train._check_axis_schedule_meta) and
+    # openpi's QualityTags.check_reward_id (checked against the quality artifact's own
+    # meta["reward_id"]). REQUIRED whenever the artifact path they bind is set — see validate() —
+    # since a launch that forgot one of these flags would otherwise train silently under a
+    # mismatched or unverified artifact.
+    axis_expected_mode: str | None = None
+    axis_expected_reward: str | None = None
+    # AXIS-Bench CFG: policy tokenizer max length (e.g. SmolVLAConfig.tokenizer_max_length). When
+    # set, every quality-artifact prompt is tokenized WITH the worst-case CFG suffix
+    # ("\nQuality: {N_BINS}\n") and the run refuses to start if any would overflow it -- the
+    # policy's own tokenizer (lerobot.processor.TokenizerProcessorStep) truncates silently from
+    # the right otherwise. See `lerobot.utils.axis_quality.check_token_budget`.
+    axis_quality_token_budget: int | None = None
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
@@ -398,6 +413,15 @@ class TrainPipelineConfig(HubMixin):
                     "in the full, unfiltered corpus it was built against -- a filtered or split "
                     "episode set would silently misalign them."
                 )
+            if self.axis_expected_mode is None or self.axis_expected_reward is None:
+                raise ValueError(
+                    "axis_schedule_path requires axis_expected_mode and axis_expected_reward: "
+                    "nothing else binds this run's claimed arm (mode + reward) to the schedule "
+                    "artifact's own meta, so a mismatched artifact would train silently under the "
+                    "wrong name. Pass both --axis_expected_mode and --axis_expected_reward "
+                    "(mirrors openpi's DataConfig.expected_mode / QualityTags.check_reward_id "
+                    "binding)."
+                )
 
         if self.axis_quality_path is not None:
             if self.axis_schedule_path is not None:
@@ -413,6 +437,21 @@ class TrainPipelineConfig(HubMixin):
                     "axis_quality_path requires axis_rows_path: the quality-tag hook conditions "
                     "a row-restricted CFG arm, and without a committed row set there is nothing "
                     "for the tag artifact's index space to bind against."
+                )
+            if self.axis_expected_reward is None:
+                raise ValueError(
+                    "axis_quality_path requires axis_expected_reward: nothing else binds this "
+                    "run's claimed reward to the quality artifact's own meta, so a mismatched "
+                    "artifact would train silently under the wrong reward. Pass "
+                    "--axis_expected_reward (mirrors openpi's QualityTags.check_reward_id "
+                    "binding)."
+                )
+            if self.sample_weighting is not None:
+                raise ValueError(
+                    "axis_quality_path and sample_weighting are two arms at once: conditioning "
+                    "and loss reweighting are two different mechanisms (mirrors openpi "
+                    "config.py's quality_path+awr_weights 'two arms at once' refusal). Pass "
+                    "only one."
                 )
 
         self._validate_distributed()

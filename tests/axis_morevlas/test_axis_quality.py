@@ -185,7 +185,9 @@ def test_validate_refuses_quality_without_rows():
 
 def test_validate_refuses_quality_with_schedule():
     """axis_quality_path and axis_schedule_path are two different AXIS regimes at once --
-    mirrors openpi config.py's schedule+quality-conditioning refusal."""
+    mirrors openpi config.py's schedule+quality-conditioning refusal. axis_expected_mode/reward
+    are supplied so the failure is isolated to the two-regimes-at-once rule, not the (separately
+    tested) required-flag rules."""
     import draccus
 
     from lerobot.configs.train import TrainPipelineConfig
@@ -201,10 +203,14 @@ def test_validate_refuses_quality_with_schedule():
             "false",
             "--axis_quality_path",
             "/tmp/q.npz",
+            "--axis_expected_reward",
+            "v2",
             "--axis_schedule_path",
             "/tmp/s.npz",
             "--axis_expected_frames",
             "10",
+            "--axis_expected_mode",
+            "drop",
         ],
     )
     with pytest.raises(ValueError, match="axis_schedule_path|axis_quality_path"):
@@ -234,9 +240,129 @@ def test_validate_accepts_quality_with_rows(tmp_path):
             "10",
             "--axis_quality_path",
             "/tmp/q.npz",
+            "--axis_expected_reward",
+            "v2",
         ],
     )
     cfg.validate()  # must not raise
+
+
+def test_validate_refuses_quality_without_expected_reward(tmp_path):
+    """B2: axis_quality_path requires axis_expected_reward -- nothing else binds this run's
+    claimed reward to the quality artifact's own meta."""
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    rows_path = tmp_path / "rows.npz"
+    np.savez(rows_path, rows=np.array([0, 1], dtype=np.int64))
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_rows_path",
+            str(rows_path),
+            "--axis_expected_frames",
+            "10",
+            "--axis_quality_path",
+            "/tmp/q.npz",
+        ],
+    )
+    with pytest.raises(ValueError, match="axis_expected_reward"):
+        cfg.validate()
+
+
+def test_validate_refuses_quality_with_sample_weighting(tmp_path):
+    """B4: axis_quality_path excludes sample_weighting (mirrors openpi config.py:763-766's
+    'two arms at once' message -- conditioning and loss reweighting are two different
+    mechanisms)."""
+    import draccus
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    rows_path = tmp_path / "rows.npz"
+    np.savez(rows_path, rows=np.array([0, 1], dtype=np.int64))
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id",
+            "u/d",
+            "--policy.type",
+            "act",
+            "--policy.push_to_hub",
+            "false",
+            "--axis_rows_path",
+            str(rows_path),
+            "--axis_expected_frames",
+            "10",
+            "--axis_quality_path",
+            "/tmp/q.npz",
+            "--axis_expected_reward",
+            "v2",
+            "--sample_weighting.type",
+            "rabc",
+        ],
+    )
+    with pytest.raises(ValueError, match="sample_weighting"):
+        cfg.validate()
+
+
+# --- reward-id binding (B2) and token-budget guard (B3) ----------------------------------------
+
+
+def test_check_reward_id_accepts_match(tmp_path):
+    from lerobot.utils.axis_quality import AxisQualityTags
+
+    q = AxisQualityTags(str(_quality_npz(tmp_path, [0, 1], reward="v2")), expected_frames=2)
+    q.check_reward_id("v2")  # must not raise
+
+
+def test_check_reward_id_refuses_mismatch(tmp_path):
+    """Both CFG arms run under one config name; the flag is the only thing separating cfg_v2
+    from cfg_phase, so it must be checked against the artifact's own reward_id."""
+    from lerobot.utils.axis_quality import AxisQualityTags
+
+    q = AxisQualityTags(str(_quality_npz(tmp_path, [0, 1], reward="v2")), expected_frames=2)
+    with pytest.raises(ValueError, match="reward"):
+        q.check_reward_id("phase")
+
+
+class _FakeTokenizer:
+    """A tiny stand-in for AutoTokenizer: one token per whitespace-separated word, so a test can
+    pick prompt lengths and budgets without a real HF download (mirrors openpi's `_tok(N)`
+    fixture in quality_conditioning_test.py)."""
+
+    def __call__(self, text, truncation=False):
+        return {"input_ids": text.split()}
+
+
+def test_check_token_budget_passes_under_budget():
+    from lerobot.utils.axis_quality import check_token_budget
+
+    # "pick up the bowl" (4) + "\nQuality: 5\n" (2 words: "Quality:" "5", split() drops the bare
+    # newlines) = 6 tokens under the fake tokenizer.
+    margin = check_token_budget(["pick up the bowl"], 10, tokenizer=_FakeTokenizer())
+    assert margin == 4
+
+
+def test_check_token_budget_raises_on_overflow():
+    from lerobot.utils.axis_quality import check_token_budget
+
+    long_prompt = " ".join(f"word{i}" for i in range(50))
+    with pytest.raises(ValueError, match="exceeding|exceed"):
+        check_token_budget([long_prompt], 10, tokenizer=_FakeTokenizer())
+
+
+def test_check_token_budget_empty_prompts_refused():
+    from lerobot.utils.axis_quality import check_token_budget
+
+    with pytest.raises(ValueError, match="prompts"):
+        check_token_budget([], 10, tokenizer=_FakeTokenizer())
 
 
 # --- train-loop wire-in ---------------------------------------------------------------------

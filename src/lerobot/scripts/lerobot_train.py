@@ -292,8 +292,44 @@ def _make_axis_schedule_sampler(schedule_path: str, num_frames: int):
     return AxisScheduleSampler(schedule_path, expected_frames=num_frames)
 
 
-def _check_axis_schedule_budget(sampler, batch_size: int, num_train_steps: int) -> None:
-    """Refuse a run whose batch size or step budget disagrees with the schedule artifact.
+def _check_axis_schedule_meta(sampler, expected_mode: str | None, expected_reward: str | None) -> None:
+    """Bind the schedule artifact's own meta to the arm this run's config claims to be.
+
+    Mirrors openpi's `_check_schedule_mode` / `_check_schedule_reward_id`
+    (data_loader.py:535-593): nothing else ties `--axis_schedule_path` to the arm name a run is
+    launched under, so a mismatched artifact would otherwise train silently under the wrong
+    name. Mode alone cannot separate `drop_top_v2` from `drop_top_phase` (same mode, different
+    reward), which is why both are checked. `TrainPipelineConfig.validate()` already REQUIRES
+    both arguments whenever `axis_schedule_path` is set, so neither is None here in practice;
+    this function still guards a future caller that skips `validate()`.
+    """
+    mode = sampler.meta.get("mode")
+    if expected_mode is not None and mode != expected_mode:
+        raise ValueError(
+            f"axis_schedule_path meta mismatch: this run expects mode={expected_mode!r} "
+            f"(--axis_expected_mode) but the schedule artifact's own meta reports mode={mode!r}. "
+            "The flag is the only thing naming this run's arm; nothing else binds it to the "
+            "artifact's actual content."
+        )
+    reward_id = sampler.meta.get("reward_id")
+    if expected_reward is not None and reward_id != expected_reward:
+        raise ValueError(
+            f"axis_schedule_path meta mismatch: this run expects reward={expected_reward!r} "
+            f"(--axis_expected_reward) but the schedule artifact's own meta reports "
+            f"reward_id={reward_id!r}. Mode alone cannot separate two schedules built from "
+            "different rewards under the same mode (e.g. drop_top_v2 vs drop_top_phase); the "
+            "flag is the only other distinguisher."
+        )
+
+
+def _check_axis_schedule_budget(
+    sampler,
+    batch_size: int,
+    num_train_steps: int,
+    parallel_dims: ParallelDims,
+    gradient_accumulation_steps: int,
+) -> None:
+    """Refuse a run whose effective batch, topology, or step budget disagrees with the schedule.
 
     Mirrors openpi's `ScheduleSampler.check_batch` / `check_num_train_steps`
     (schedule_sampler.py:60-91), checked at the same point openpi checks them: at the data
@@ -301,14 +337,32 @@ def _check_axis_schedule_budget(sampler, batch_size: int, num_train_steps: int) 
     (data_loader.py:827, 833) -- not in `validate()`, since neither the batch/DataLoader join
     nor the step budget's relationship to the artifact is knowable there.
 
-    Batch: torch's DataLoader cuts the sampler's flat index stream into batches of
-    `batch_size`, so the schedule's row-major (total_steps, batch) block only reproduces the
-    artifact's own batches one-for-one when `batch_size == sampler.batch`. A SMALLER
-    `batch_size` silently splits each scheduled row into multiple real batches, doubling (or
-    worse) the optimizer steps spent on the same content with no error. A LARGER `batch_size`
-    silently concatenates two-or-more scheduled rows into one real batch -- for the anneal arm
-    this merges draws from opposite sides of the ramp boundary into a single step, corrupting
-    exactly the transition the arm exists to control.
+    Batch is GLOBAL, not per-device: openpi is a single JAX process that cuts one global batch
+    by hand, so the artifact's `batch` dimension is that global count. `cfg.batch_size` in this
+    fork is PER-DEVICE (see `train()`'s own `samples_per_step = cfg.batch_size *
+    parallel_dims.dp_world_size`, ~line 746) -- so the comparison that matters is against the
+    EFFECTIVE batch (`batch_size * dp_world_size`), not against `batch_size` alone. torch's
+    DataLoader cuts the sampler's flat index stream into batches of that effective size, so the
+    schedule's row-major (total_steps, batch) block only reproduces the artifact's own batches
+    one-for-one when `effective == sampler.batch`. A SMALLER effective batch silently splits
+    each scheduled row into multiple real batches, doubling (or worse) the optimizer steps spent
+    on the same content with no error. A LARGER one silently concatenates two-or-more scheduled
+    rows into one real batch -- for the anneal arm this merges draws from opposite sides of the
+    ramp boundary into a single step, corrupting exactly the transition the arm exists to
+    control.
+
+    Sharded / accumulated replay is refused OUTRIGHT, not merely budget-checked: this fork's
+    `AxisScheduleSampler.__iter__` hands the schedule's flat index stream straight to torch's
+    `DataLoader`. Under `dp_world_size > 1`, accelerate's `BatchSamplerShard` splits and
+    distributes that stream across ranks; under `gradient_accumulation_steps > 1`, the trainer
+    groups consecutive micro-batches before an optimizer step. NEITHER order has been checked
+    against openpi's single-process replay of the same artifact (openpi is one JAX process,
+    cutting one global batch by hand -- there is no sharding or accumulation to reorder rows).
+    Refusing a MAYBE-wrong run beats allowing one; proving the sharded/accumulated order
+    equivalent to openpi's is Plan 3 (launcher) work, not this guard's. Today, schedule arms run
+    single-process with `batch_size == sampler.batch` (dp_world_size=1, no accumulation) -- the
+    GR00T (batch-320) artifacts remain valid arm definitions, just refused here until Plan 3
+    proves sharded replay equivalent.
 
     Steps: the torch DataLoader restarts an exhausted sampler rather than raising, so a step
     budget longer than the schedule silently replays it from row 0 and grants an unrequested
@@ -316,15 +370,35 @@ def _check_axis_schedule_budget(sampler, batch_size: int, num_train_steps: int) 
     invalidates the artifact's own coverage numbers (epochs, unique frames) -- so, mirroring
     openpi's exact policy, it is logged rather than refused.
     """
-    if batch_size != sampler.batch:
+    if parallel_dims.dp_world_size > 1:
         raise ValueError(
-            f"axis_schedule_path batch mismatch: the schedule was built for batch={sampler.batch} "
-            f"but training requests batch_size={batch_size}. A smaller batch_size would split a "
-            "scheduled row into multiple real batches (silently multiplying the optimizer steps "
-            "spent on the same content); a larger one would concatenate rows across the "
-            "schedule's own batch boundaries (e.g. merging draws from opposite sides of the "
-            "anneal ramp into one step). The artifact IS the experiment's record of what was "
-            f"seen; regenerate it for batch_size={batch_size} rather than reshaping it here."
+            f"axis_schedule_path with dp_world_size={parallel_dims.dp_world_size} > 1: the "
+            "schedule replay order under a sharded DataLoader (accelerate's BatchSamplerShard "
+            "splitting the artifact's flat row stream across ranks) has not been proven "
+            "equivalent to openpi's single-process replay of the same artifact. Resolving that "
+            "is Plan 3 (launcher) work; run schedule arms single-process (dp_world_size=1) "
+            "until then."
+        )
+    if gradient_accumulation_steps > 1:
+        raise ValueError(
+            "axis_schedule_path with cfg.accelerator.gradient_accumulation.steps="
+            f"{gradient_accumulation_steps} > 1: grouping the schedule's rows into accumulated "
+            "micro-steps before an optimizer step has not been proven equivalent to openpi's "
+            "single-process replay of the same artifact. Resolving that is Plan 3 (launcher) "
+            "work; run schedule arms with gradient_accumulation.steps=1 until then."
+        )
+    effective = batch_size * parallel_dims.dp_world_size
+    if effective != sampler.batch:
+        raise ValueError(
+            f"axis_schedule_path batch mismatch: the schedule was built for a GLOBAL batch="
+            f"{sampler.batch} but this run's effective batch is {effective} "
+            f"(batch_size={batch_size} x dp_world_size={parallel_dims.dp_world_size}). A "
+            "smaller effective batch would split a scheduled row into multiple real batches "
+            "(silently multiplying the optimizer steps spent on the same content); a larger one "
+            "would concatenate rows across the schedule's own batch boundaries (e.g. merging "
+            "draws from opposite sides of the anneal ramp into one step). The artifact IS the "
+            f"experiment's record of what was seen; regenerate it for effective batch={effective} "
+            "rather than reshaping it here."
         )
     if num_train_steps > sampler.total_steps:
         raise ValueError(
@@ -354,6 +428,48 @@ def _make_axis_quality_tags(quality_path: str, num_frames: int):
     from lerobot.utils.axis_quality import AxisQualityTags
 
     return AxisQualityTags(quality_path, expected_frames=num_frames)
+
+
+def _check_axis_quality_token_budget(tags, cfg: TrainPipelineConfig) -> None:
+    """Refuse to start a CFG run whose prompts would silently overflow the policy's tokenizer.
+
+    B3: opt-in via `cfg.axis_quality_token_budget` (None by default -- a no-op). Reaching the
+    REAL tokenizer object the training loop will use means constructing the full pre/post
+    processor pipeline (`make_pre_post_processors`), which is not built until after this call
+    site in `train()` and depends on the policy/dataset stats already being loaded. Rather than
+    reorder construction around this guard, this loads a fresh `AutoTokenizer` by
+    `cfg.policy.vlm_model_name` -- the SAME name and the SAME `AutoTokenizer.from_pretrained`
+    call `TokenizerProcessorStep.__post_init__` makes (processor/tokenizer_processor.py:113), so
+    the tokenization this guard checks is byte-for-byte what the real pipeline will do, just
+    built from a second, throwaway instance instead of the pipeline's own. That is the least
+    invasive option that is still faithful, rather than an approximation of the real tokenizer.
+
+    Only implemented for VLM policies that expose `vlm_model_name` (SmolVLA today); a policy
+    type without one raises immediately naming the gap rather than silently skipping the guard.
+    """
+    if cfg.axis_quality_token_budget is None:
+        return
+    tokenizer_name = getattr(cfg.policy, "vlm_model_name", None)
+    if tokenizer_name is None:
+        raise ValueError(
+            "axis_quality_token_budget is set but cfg.policy has no vlm_model_name attribute -- "
+            f"this guard is only implemented for tokenizer-based VLM policies (policy.type="
+            f"{cfg.policy.type!r} has none). Unset axis_quality_token_budget, or extend "
+            "_check_axis_quality_token_budget for this policy type."
+        )
+    from transformers import AutoTokenizer
+
+    from lerobot.utils.axis_quality import check_token_budget
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    margin = check_token_budget(tags.prompts, cfg.axis_quality_token_budget, tokenizer)
+    if is_main_process():
+        logging.info(
+            "axis_quality_token_budget: max_token_len=%d tokenizer=%s min_margin=%d tokens",
+            cfg.axis_quality_token_budget,
+            tokenizer_name,
+            margin,
+        )
 
 
 def _check_axis_frames(dataset, expected: int | None) -> None:
@@ -418,8 +534,36 @@ def make_dataloaders(
         # sampler -- see AxisScheduleSampler.load_state_dict).
         shuffle = False
         if cfg.axis_schedule_path is not None:
+            # B5: bound to the corpus BEFORE constructing the sampler, same guard the
+            # axis_rows_path branch below already runs -- a frame-count mismatch means the
+            # schedule's row indices land on a different corpus than the one just loaded.
+            _check_axis_frames(dataset, cfg.axis_expected_frames)
             sampler = _make_axis_schedule_sampler(cfg.axis_schedule_path, dataset.num_frames)
-            _check_axis_schedule_budget(sampler, cfg.batch_size, cfg.steps)
+            _check_axis_schedule_meta(sampler, cfg.axis_expected_mode, cfg.axis_expected_reward)
+            _check_axis_schedule_budget(
+                sampler,
+                cfg.batch_size,
+                cfg.steps,
+                parallel_dims,
+                cfg.accelerator.gradient_accumulation.steps,
+            )
+            if is_main_process():
+                # Provenance line mirroring openpi's data_loader.py:833-841.
+                logging.info(
+                    "index schedule %s: mode=%s reward=%s steps=%d batch=%d keep_fraction=%s "
+                    "unique_episodes=%s unique_frames=%s epochs=%.2f seed=%s config_hash=%s",
+                    cfg.axis_schedule_path,
+                    sampler.meta.get("mode"),
+                    sampler.meta.get("reward_id"),
+                    sampler.total_steps,
+                    sampler.batch,
+                    sampler.meta.get("keep_fraction"),
+                    sampler.meta.get("unique_episodes"),
+                    sampler.meta.get("unique_frames"),
+                    sampler.meta.get("epochs_over_unique_rows", 0.0),
+                    sampler.meta.get("seed"),
+                    sampler.meta.get("config_hash"),
+                )
         elif cfg.axis_rows_path is not None:
             _check_axis_frames(dataset, cfg.axis_expected_frames)
             sampler = _make_axis_sampler(
@@ -738,6 +882,11 @@ def train(cfg: TrainPipelineConfig):
         if is_main_process():
             logging.info(f"Creating CFG quality tags: {cfg.axis_quality_path}")
         axis_quality_tags = _make_axis_quality_tags(cfg.axis_quality_path, dataset.num_frames)
+        # B2: bind the artifact's own reward to the reward this run's config claims -- nothing
+        # else does (validate() already requires axis_expected_reward whenever axis_quality_path
+        # is set).
+        axis_quality_tags.check_reward_id(cfg.axis_expected_reward)
+        _check_axis_quality_token_budget(axis_quality_tags, cfg)
 
     # --- banner (main process only; numel() reads metadata — on DTensors it is the GLOBAL shape,
     # so the totals are correct even after sharding) ---------------------------------------------

@@ -134,6 +134,30 @@ class AxisQualityTags:
                 "(axis.dataset.quality_labels.DROP_WHOLE)."
             )
 
+    @property
+    def reward_id(self) -> str:
+        """The reward this artifact was built from. `__init__` already required it non-None."""
+        return str(self.meta["reward_id"])
+
+    def check_reward_id(self, expected: str) -> None:
+        """Bind this artifact's own reward to the reward this run's config claims to condition on.
+
+        Mirrors openpi's `QualityTags.check_reward_id`, adapted: openpi checks the artifact's
+        FILENAME against its own meta (the two CFG arms there share one config name and
+        structurally identical artifacts, so the filename is the only other distinguisher). This
+        fork instead asks the caller to state the expected reward directly via
+        `--axis_expected_reward`, since `TrainPipelineConfig.validate()` already REQUIRES that
+        flag whenever `axis_quality_path` is set -- the flag IS the claim, so there is nothing to
+        parse back out of a path.
+        """
+        if str(expected) != self.reward_id:
+            raise ValueError(
+                f"quality artifact {self.path} reports reward_id={self.reward_id!r} but this "
+                f"run expects reward={expected!r} (--axis_expected_reward). Both CFG arms run "
+                f"under one config name, so this run would record itself as {expected!r} while "
+                f"actually conditioning on {self.reward_id!r}."
+            )
+
     def _check_bin_count(self) -> None:
         """Bind the offline tier's N_BINS to this file's copy of it.
 
@@ -233,3 +257,54 @@ def apply_quality_tags(batch: dict, tags: AxisQualityTags) -> dict:
     batch["task"] = new_task
     frac = (n_tagged / len(new_task)) if new_task else 0.0
     return {"cfg_tagged_frac": frac}
+
+
+def check_token_budget(prompts: list[str], max_token_len: int, tokenizer) -> int:
+    """Tokenize every prompt WITH the worst-case CFG suffix and RAISE if any would overflow.
+
+    Mirrors openpi's `quality_conditioning.check_token_budget`. SmolVLA's
+    `lerobot.processor.TokenizerProcessorStep` tokenizes `batch["task"]` with
+    `truncation=True, padding=config.pad_language_to, max_length=config.tokenizer_max_length`
+    (see `policies/smolvla/processor_smolvla.py`) and truncates from the right SILENTLY -- no
+    warning, no error -- so a prompt that overflows loses its tail with no signal anywhere a log
+    scrape would catch. That happens for the CFG arm specifically, since only the quality-tag
+    hook lengthens the prompt: it appends `PROMPT_MARKER + tag` (e.g. `"\\nQuality: 5"`), and
+    `NewLineTaskProcessorStep` then appends its own trailing newline if one is not already there.
+    So the worst case per prompt is the highest tag (`N_BINS`) plus that trailing newline --
+    `f"{prompt}{PROMPT_MARKER}{N_BINS}\\n"` -- and `N_BINS` is read from this module's own
+    constant rather than hardcoded, so a change to it cannot silently under-check.
+
+    `tokenizer` is called with `truncation=False` so the count returned is the TRUE, unclamped
+    length -- unlike the processor's own call, which would already have truncated by the time
+    any caller could measure it.
+
+    Returns the minimum margin (`max_token_len - tokens_used`) across all prompts, for the run
+    record; raises `ValueError` naming the worst prompt if any prompt would overflow.
+    """
+    if not prompts:
+        raise ValueError(
+            "no prompts to check: the token-budget guard would pass vacuously. The artifact "
+            "must carry the corpus's task strings (AxisQualityTags.prompts)."
+        )
+    max_token_len = int(max_token_len)
+    margin = max_token_len
+    worst = prompts[0]
+    worst_n = 0
+    for prompt in prompts:
+        text = f"{prompt}{PROMPT_MARKER}{N_BINS}\n"
+        n = len(tokenizer(text, truncation=False)["input_ids"])
+        m = max_token_len - n
+        if m < margin:
+            margin = m
+            worst = prompt
+            worst_n = n
+    if margin < 0:
+        raise ValueError(
+            f"quality-tag prompt {worst[:120]!r} plus the worst-case CFG suffix "
+            f"{PROMPT_MARKER!r}{N_BINS}\\n tokenizes to {worst_n} tokens, exceeding "
+            f"max_token_len={max_token_len} by {-margin} tokens. The policy's tokenizer "
+            "truncates silently from the right, which is indistinguishable from a correctly "
+            "tokenized prompt once training starts; shorten the corpus prompts, raise the "
+            "policy's tokenizer_max_length, or drop this reward's tag artifact."
+        )
+    return margin
