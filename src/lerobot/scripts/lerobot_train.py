@@ -472,6 +472,41 @@ def _check_axis_quality_token_budget(tags, cfg: TrainPipelineConfig) -> None:
         )
 
 
+def _check_axis_constant_token_budget(dataset, cfg: TrainPipelineConfig) -> None:
+    """The constant-tag twin of `_check_axis_quality_token_budget`.
+
+    Same guard, different prompt source: there is no artifact carrying the corpus's task
+    strings, so the strings come from the dataset's own task table (`meta.tasks` is indexed by
+    the task string), which is exactly the set the train loop's `batch["task"]` draws from.
+    Opt-in via the same `cfg.axis_quality_token_budget` flag.
+    """
+    if cfg.axis_quality_token_budget is None:
+        return
+    tokenizer_name = getattr(cfg.policy, "vlm_model_name", None)
+    if tokenizer_name is None:
+        raise ValueError(
+            "axis_quality_token_budget is set but cfg.policy has no vlm_model_name attribute -- "
+            f"this guard is only implemented for tokenizer-based VLM policies (policy.type="
+            f"{cfg.policy.type!r} has none)."
+        )
+    from transformers import AutoTokenizer
+
+    from lerobot.utils.axis_quality import check_token_budget
+
+    prompts = [str(t) for t in dataset.meta.tasks.index]
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    margin = check_token_budget(prompts, cfg.axis_quality_token_budget, tokenizer)
+    if is_main_process():
+        logging.info(
+            "axis_quality_token_budget (constant tag): max_token_len=%d tokenizer=%s "
+            "min_margin=%d tokens over %d task strings",
+            cfg.axis_quality_token_budget,
+            tokenizer_name,
+            margin,
+            len(prompts),
+        )
+
+
 def _check_axis_frames(dataset, expected: int | None) -> None:
     """Refuse to start if the dataset's frame count doesn't match the AXIS rows artifact."""
     if expected is not None and dataset.num_frames != expected:
@@ -888,6 +923,39 @@ def train(cfg: TrainPipelineConfig):
         axis_quality_tags.check_reward_id(cfg.axis_expected_reward)
         _check_axis_quality_token_budget(axis_quality_tags, cfg)
 
+    axis_constant_tagger = None
+    if cfg.axis_quality_constant_tag is not None:
+        import numpy as _np
+
+        from lerobot.utils.axis_quality import ConstantQualityTagger
+
+        # Committed epoch length: the rows artifact IS the per-epoch draw set (validate()
+        # requires axis_rows_path with this flag; _make_axis_sampler already range-checked it).
+        _epoch_len = int(_np.load(cfg.axis_rows_path)["rows"].shape[0])
+        _samples_per_step = cfg.batch_size * parallel_dims.dp_world_size
+        axis_constant_tagger = ConstantQualityTagger(
+            cfg.axis_quality_constant_tag,
+            seed=cfg.seed if cfg.seed is not None else 0,
+            epoch_len=_epoch_len,
+            samples_per_step=_samples_per_step,
+        )
+        if is_main_process():
+            logging.info(
+                "Creating stage-2 constant quality tagger: tag=%d epoch_len=%d "
+                "samples_per_step=%d boundary_exact=%s",
+                axis_constant_tagger.q_ep,
+                _epoch_len,
+                _samples_per_step,
+                axis_constant_tagger.boundary_exact,
+            )
+            if not axis_constant_tagger.boundary_exact:
+                logging.warning(
+                    "epoch_len %% samples_per_step != 0: the presentation key is batch-granular "
+                    "at each epoch boundary (one straddling batch keys on the earlier "
+                    "presentation)."
+                )
+        _check_axis_constant_token_budget(dataset, cfg)
+
     # --- banner (main process only; numel() reads metadata — on DTensors it is the GLOBAL shape,
     # so the totals are correct even after sharding) ---------------------------------------------
     # One loop step consumes one micro-batch on every dp worker; the optimizer sees
@@ -1031,6 +1099,11 @@ def train(cfg: TrainPipelineConfig):
             # which auto-registers a meter for any key not already known to the tracker. This hook
             # runs in the train loop, before update_policy is even called, so it merges directly
             # into the SAME train_tracker object rather than routing through output_dict.
+            train_tracker.update_metrics(quality_stats)
+        elif axis_constant_tagger is not None:
+            # Stage-2 constant tag: same in-place batch["task"] contract and the same
+            # cfg_tagged_frac metric as the stage-1 artifact hook above.
+            quality_stats = axis_constant_tagger.apply(batch, step)
             train_tracker.update_metrics(quality_stats)
         batch = _preprocess_dataset_batch(batch, dataset.meta.camera_keys, cfg.rename_map, preprocessor)
         train_tracker.preprocessing_s = time.perf_counter() - preprocessing_start

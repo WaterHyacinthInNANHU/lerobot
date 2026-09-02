@@ -208,6 +208,14 @@ class TrainPipelineConfig(HubMixin):
     # policy's own tokenizer (lerobot.processor.TokenizerProcessorStep) truncates silently from
     # the right otherwise. See `lerobot.utils.axis_quality.check_token_budget`.
     axis_quality_token_budget: int | None = None
+    # AXIS-Bench stage-2 CFG (the finetune): append a CONSTANT "\nQuality: {tag}" to every task
+    # with openpi's presentation-keyed two-level dropout (DROP_WHOLE_STAGE2/DROP_COMPONENT_STAGE2,
+    # tagged marginal 0.8075) -- mirrors openpi's LiberoQualityConditioning, where the FT corpus
+    # is uniformly expert so every sample carries the same tag and the dropout is re-drawn each
+    # presentation (a per-row artifact over a multi-epoch finetune would be a fixed partition,
+    # not a dropout). Requires axis_rows_path (committed row set = exact epoch length for the
+    # presentation key); excludes axis_quality_path/axis_schedule_path -- see validate().
+    axis_quality_constant_tag: int | None = None
 
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
@@ -452,6 +460,40 @@ class TrainPipelineConfig(HubMixin):
                     "and loss reweighting are two different mechanisms (mirrors openpi "
                     "config.py's quality_path+awr_weights 'two arms at once' refusal). Pass "
                     "only one."
+                )
+
+        if self.axis_quality_constant_tag is not None:
+            if self.axis_quality_path is not None:
+                raise ValueError(
+                    "axis_quality_constant_tag and axis_quality_path are two conditioning "
+                    "regimes at once: the stage-1 artifact carries per-row tags with BAKED "
+                    "dropout, the stage-2 constant tag re-draws its dropout per presentation. "
+                    "A run is one stage; pass only one."
+                )
+            if self.axis_schedule_path is not None:
+                raise ValueError(
+                    "axis_quality_constant_tag and axis_schedule_path are two AXIS regimes at "
+                    "once (mirrors the axis_quality_path refusal): the constant tag needs a "
+                    "committed row set, not a schedule replay."
+                )
+            if self.axis_rows_path is None:
+                raise ValueError(
+                    "axis_quality_constant_tag requires axis_rows_path: the presentation-keyed "
+                    "dropout derives which pass through the corpus a step belongs to from the "
+                    "committed row count, and AxisRowSampler's one-pass-per-epoch draw is what "
+                    "makes that derivation exact. Without it the epoch length would be a "
+                    "sampler-dependent guess."
+                )
+            if not 1 <= int(self.axis_quality_constant_tag) <= 5:
+                raise ValueError(
+                    f"axis_quality_constant_tag={self.axis_quality_constant_tag} is not a "
+                    "quality bin in [1, 5]; 0 is the untagged sentinel (leave the flag unset "
+                    "to disable conditioning)."
+                )
+            if self.sample_weighting is not None:
+                raise ValueError(
+                    "axis_quality_constant_tag and sample_weighting are two arms at once "
+                    "(mirrors the axis_quality_path refusal)."
                 )
 
         self._validate_distributed()

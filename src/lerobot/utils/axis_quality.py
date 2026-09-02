@@ -308,3 +308,148 @@ def check_token_budget(prompts: list[str], max_token_len: int, tokenizer) -> int
             "policy's tokenizer_max_length, or drop this reward's tag artifact."
         )
     return margin
+
+
+# =================================================================================================
+# STAGE 2 (the AXIS finetune). Constant tag, presentation-keyed dropout -- no artifact.
+# =================================================================================================
+
+# Copies of openpi's `quality_conditioning.DROP_WHOLE_STAGE2` / `DROP_COMPONENT_STAGE2` (0.15 /
+# 0.05, tagged marginal 0.8075), duplicated for the same reason every other constant in this
+# module is: this fork imports neither `axis` nor `openpi`.
+DROP_WHOLE_STAGE2 = 0.15
+DROP_COMPONENT_STAGE2 = 0.05
+
+
+class ConstantQualityTagger:
+    """Append a CONSTANT ``"\\nQuality: {q}"`` to ``batch["task"]`` with presentation-keyed dropout.
+
+    Mirrors `openpi.training.quality_conditioning.LiberoQualityConditioning` -- the stage-2
+    (finetune) half of the CFG recipe, where the FT corpus is uniformly expert so every sample
+    carries the SAME tag and only the dropout differs between rows. Two properties are ported
+    deliberately:
+
+    - THE DRAW IS PURE in ``(seed, presentation, episode_index, frame_index)``, mixed through
+      SHA-256 exactly as openpi's ``LiberoQualityConditioning.dropped`` does (same key string,
+      same digest-to-rng construction), so any sample's fate is recomputable offline from the run
+      record alone -- no worker RNG state, no batch-order dependence.
+    - THE PRESENTATION IS IN THE KEY. Keyed on the row alone, a multi-epoch finetune would not
+      have a dropout but a fixed PARTITION: the unconditional branch fit on one frozen 19.25% of
+      rows seen every epoch while the conditional branch never saw them once. Re-drawing per
+      presentation lets both branches see all the data, as pi0.7 does.
+
+    WHERE THE PRESENTATION COMES FROM (the one adaptation). openpi threads a per-row counter
+    through a dataset wrapper; this fork's hook runs in the train loop where the loop step is
+    authoritative, so ``presentation = (step * samples_per_step) // epoch_len`` -- exact whenever
+    epoch boundaries land on loop-step boundaries (``epoch_len % samples_per_step == 0``, true for
+    the Task-8 launch: 86,912 rows / 64 = 1,358 steps exactly), and batch-granular otherwise (the
+    single straddling batch per epoch keys on the earlier presentation; a construction-time warning
+    names the case). Requires `axis_rows_path` so ``epoch_len`` is a committed row count with
+    AxisRowSampler's exact one-pass-per-epoch semantics, not a sampler-dependent guess.
+    """
+
+    def __init__(
+        self,
+        q_ep: int,
+        *,
+        seed: int,
+        epoch_len: int,
+        samples_per_step: int,
+        drop_whole: float = DROP_WHOLE_STAGE2,
+        drop_component: float = DROP_COMPONENT_STAGE2,
+    ) -> None:
+        q = int(q_ep)
+        if not 1 <= q <= N_BINS:
+            # Mirrors LiberoQualityConditioning.__post_init__: NO_TAG (0) reads like "off" but
+            # would emit "Quality: 0", a sixth condition no eval prompt can match. Refused at
+            # construction so it fails at config time, not on the first batch.
+            raise ValueError(
+                f"stage-2 constant quality tag {q} is not a bin in [1, {N_BINS}]; {NO_TAG} is "
+                "the untagged sentinel and must never reach a prompt. To disable conditioning, "
+                "leave axis_quality_constant_tag unset."
+            )
+        for name, p in (("drop_whole", drop_whole), ("drop_component", drop_component)):
+            if not 0.0 <= float(p) < 1.0:
+                raise ValueError(f"{name}={p} is outside [0, 1).")
+        if float(drop_whole) == 0.0 and float(drop_component) == 0.0:
+            raise ValueError(
+                "both stage-2 dropout levels are zero, so every row is tagged and CFG has no "
+                "unconditional branch to guide away from -- the arm degenerates to plain "
+                "conditional BC while still being called CFG."
+            )
+        if int(epoch_len) <= 0 or int(samples_per_step) <= 0:
+            raise ValueError(
+                f"epoch_len={epoch_len} and samples_per_step={samples_per_step} must be positive."
+            )
+        self.q_ep = q
+        self.seed = int(seed)
+        self.epoch_len = int(epoch_len)
+        self.samples_per_step = int(samples_per_step)
+        self.drop_whole = float(drop_whole)
+        self.drop_component = float(drop_component)
+        self.boundary_exact = self.epoch_len % self.samples_per_step == 0
+
+    def dropped(self, presentation: int, episode_index: int, frame_index: int) -> bool:
+        """Whether this PRESENTATION of this row is dropped. Byte-identical key string and
+        digest-to-rng construction as openpi's `LiberoQualityConditioning.dropped`; both levels
+        are drawn unconditionally (`random(2)`) so a future second metadata component slots in
+        without moving the first component's stream."""
+        import hashlib
+
+        digest = hashlib.sha256(
+            f"{int(self.seed)}:{int(presentation)}:{int(episode_index)}:{int(frame_index)}".encode()
+        ).digest()
+        u = np.random.default_rng(int.from_bytes(digest[:8], "little")).random(2)
+        return bool(u[0] < self.drop_whole or u[1] < self.drop_component)
+
+    def presentation_for_step(self, step: int) -> int:
+        """Which pass through the corpus loop step `step` (0-based) belongs to."""
+        return (int(step) * self.samples_per_step) // self.epoch_len
+
+    def apply(self, batch: dict, step: int) -> dict:
+        """Tag `batch["task"]` in place for loop step `step`; returns `{"cfg_tagged_frac": ...}`.
+
+        Same in-place contract and stats key as `apply_quality_tags`, so the train-loop wiring
+        and the `step:N` log line are shared shape-for-shape with the stage-1 artifact hook.
+        """
+        task = batch["task"]
+        for key in ("episode_index", "frame_index"):
+            if key not in batch:
+                # Mirrors LiberoQualityConditioning.__call__'s raising lookups: the draw is keyed
+                # on the row, and a defaulted key would silently give every row one fate.
+                raise KeyError(
+                    f"batch has no {key!r}, so the stage-2 dropout draw cannot be keyed on the "
+                    "row. The dataset must surface episode_index and frame_index (LeRobotDataset "
+                    "does by default)."
+                )
+        eps = _to_1d_int(batch["episode_index"], "episode_index", len(task))
+        frs = _to_1d_int(batch["frame_index"], "frame_index", len(task))
+        pres = self.presentation_for_step(step)
+        new_task: list[str] = []
+        n_tagged = 0
+        for t, ep, fr in zip(task, eps, frs, strict=True):
+            if is_tagged(t):
+                raise RuntimeError(
+                    f"task {str(t)[:120]!r} already carries a quality tag ({PROMPT_MARKER!r}), "
+                    "so tagging it would apply the tag TWICE. The quality hook is wired into the "
+                    "train loop more than once, or the corpus tasks carry the tag already."
+                )
+            if self.dropped(pres, ep, fr):
+                new_task.append(t)
+            else:
+                new_task.append(f"{t}{PROMPT_MARKER}{self.q_ep}")
+                n_tagged += 1
+        batch["task"] = new_task
+        frac = (n_tagged / len(new_task)) if new_task else 0.0
+        return {"cfg_tagged_frac": frac}
+
+
+def _to_1d_int(x, name: str, expected_len: int) -> list[int]:
+    arr = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+    arr = arr.reshape(-1)
+    if len(arr) != expected_len:
+        raise ValueError(
+            f"batch[{name!r}] has {len(arr)} entries but batch['task'] has {expected_len}: "
+            "cannot join them row-for-row."
+        )
+    return [int(v) for v in arr]
